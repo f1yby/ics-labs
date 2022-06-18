@@ -1,0 +1,305 @@
+                            | #/* begin ncopy-ys */
+                            | ##################################################################
+                            | # ncopy.ys - Copy a src block of len words to dst.
+                            | # Return the number of positive words (>0) contained in src.
+                            | #
+                            | # Include your name and ID here.
+                            | #
+                            | # Describe how and why you modified the baseline code.
+                            | #
+                            | ##################################################################
+                            | # Do not modify this portion
+                            | # Function prologue.
+                            | # %rdi = src, %rsi = dst, %rdx = len
+0x000:                      | ncopy:
+                            | 
+                            | ##################################################################
+                            | # 0. 优化原则
+                            | #	0.1 性能计分按照数组大小从1～64平均计算CPE，因而有两个优化方向：
+                            | #		0.1.1 降低每次拷贝数据的操作[L]
+                            | #		0.1.2 降低循环以外的常数次操作[C](经过测试，最少的常数次操作是[C0]10次,即直接ret的操作数)
+                            | 
+                            | #	0.2 Average CPE=\Sigma( L + C / n)= L + 0.075 * C = L + 0.075 * Cf + 0.75, 因而 L 必须降低到 6.75 以下，考虑到函数中的常数操作[Cf]的影响以及[L]的计算公式，因而
+                            | #		0.2.1 L应当控制在5 ～ 6
+                            | #		0.2.2 Cf不应当超过30
+                            | #
+                            | # 1. 循环展开 [-L, +Cf, +size]
+                            | #	循环展开能有效降低无用的addq，理论上展开的越多性能越好，然而循环展开会增加边界判断的开销，并且增加文件大小
+                            | #	考虑展开 n 层循环, L = 6 + 3/n，由 0.2.1, n>=3, 以下是相对性能
+                            | #	n	CPE
+                            | #	4	9.55
+                            | #	8	8.75
+                            | #	16	9.23
+                            | #	n = 16 时 文件大小已经几乎超过 1000b 没有进一步的优化空间,而Cf带来的损耗已经超过了循环展开的收益
+                            | #	因而考虑n = 8 ～ 13的循环展开
+                            | # 2. 消除 nop [-L]
+                            | # 	2.1 加载使用，交叉相邻 2 ～  3条 load-use 以消除
+                            | #		mrmovq (%rdi), %rcx # val
+                            | #    		mrmovq 0x8(%rdi), %r9
+                            | #    		rmmovq %rcx, (%rsi)
+                            | #    		rmmovq %r9, 0x8(%rsi)
+                            | #    		andq %rcx, %rcx
+                            | #    		jle nopsX1
+                            | #    		iaddq 0x1, %rax # cnt + 1
+                            | #		nopsX1:
+                            | #    		andq %r9, %r9
+                            | #    		jle nopsX2
+                            | #    		iaddq 0x1, %rax # cnt + 1
+                            | #		nopsX2:
+                            | #	然而实际上在ncopy中所有的load-use中use都是只读不写，在 pipe-full中加入 mValM-eValA 的转发，彻底消除 mrmove - rmmovq 中的气泡
+                            | #	L = 5 + 3 / n
+                            | #
+                            | #	2.2 分支预测，使用cmove消除，然而cmove并没有提高性能也没有减小文件大小
+                            | # 3. Cf 优化
+                            | #	3.1 使用 iaddq
+                            | #	3.2 使用 树状结构处理边界条件, 考虑一次op可以同时使jl,je,jg工作，充分利用每次op的信息，因而有以下两种优化（未修改forward）
+                            | #		3.2.1
+                            | #    			iaddq 0xfffffffffffffff6, %rdx
+                            | #    			jge loopX
+                            | #    			irmovq 0x1, %r10
+                            | #    			andq %rdx, %r10
+                            | #    			jne LO
+                            | #	    		iaddq 0x8, %rdx
+                            | #    			jl Done
+                            | #    			je L2
+                            | #    			iaddq 0xfffffffffffffffc, %rdx
+                            | #    			jl L4
+                            | #    			je L6
+                            | #    			jg L8
+                            | #			LO:
+                            | #    			mrmovq (%rdi), %r9 # val
+                            | #    			iaddq 0x8, %rdi
+                            | #			rmmovq %r9, (%rsi)
+                            | #			iaddq 0x8, %rsi
+                            | #			andq %r9, %r9
+                            | #			jle nopsO
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nopsO:
+                            | #			iaddq 0x7, %rdx
+                            | #			jl Done
+                            | #			je L2
+                            | #
+                            | #			iaddq 0xfffffffffffffffc, %rdx
+                            | #			jl L4
+                            | #			je L6
+                            | #			L8:
+                            | #			mrmovq 0x38(%rdi), %rcx
+                            | #			mrmovq 0x30(%rdi), %r9
+                            | #			rmmovq %rcx, 0x38(%rsi)
+                            | #			rmmovq %r9, 0x30(%rsi)
+                            | #			andq %rcx, %rcx
+                            | #			jle nops8
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops8:
+                            | #			andq %r9, %r9
+                            | #			jle nops7
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops7:
+                            | #			L6:
+                            | #			mrmovq 0x28(%rdi), %rcx # val
+                            | #			mrmovq 0x20(%rdi), %r9 # val
+                            | #			rmmovq %rcx, 0x28(%rsi)
+                            | #			rmmovq %r9, 0x20(%rsi)
+                            | #			andq %rcx, %rcx
+                            | #			jle nops6
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops6:
+                            | #			andq %r9, %r9
+                            | #			jle nops5
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops5:
+                            | #			L4:
+                            | #			mrmovq 0x18(%rdi), %rcx # val
+                            | #			mrmovq 0x10(%rdi), %r9 # val
+                            | #			rmmovq %rcx, 0x18(%rsi)
+                            | #			rmmovq %r9, 0x10(%rsi)
+                            | #			andq %rcx, %rcx
+                            | #			jle nops4
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops4:
+                            | #			andq %r9, %r9
+                            | #			jle nops3
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops3:
+                            | #			L2:
+                            | #			mrmovq 0x8(%rdi), %rcx # val
+                            | #			mrmovq (%rdi), %r9 # val
+                            | #			rmmovq %rcx, 0x8(%rsi)
+                            | #			rmmovq %r9, (%rsi)
+                            | #			andq %rcx, %rcx
+                            | #			jle nops2
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops2:
+                            | #			andq %r9, %r9
+                            | #			jle nops1
+                            | #			iaddq 0x1, %rax # cnt + 1
+                            | #			nops1:
+                            | #		3.2.2 即目前使用的结构
+                            | #	3.2.1分奇数偶数处理，受限于文件大小，效果不佳，3.2.2使用优先 n=1, n=2, n=3的树状结构，在不使用forward的情况下能达到 7.73
+                            | #	3.3 优化n较小时的情况
+                            | #		观察 CPE发现，当n较大时往往CPE能小于7.5甚至7，而n<8时CPE往往非常高，因而需要在不影响 L的情况下继续优化 Cf
+                            | #		3.3.1 循环旁路
+                            | #		A:
+                            | #			jmp compare
+                            | #				Loop
+                            | #			compare:
+                            | #    			iaddq 0xfffffffffffffff6, %rdx
+                            | #    			jge loopX
+                            | #		B:
+                            | #			iaddq 0xfffffffffffffff6, %rdx
+                            | #			jl loopend
+                            | #				Loop
+                            | #			compare:
+                            | #    			iaddq 0xfffffffffffffff6, %rdx
+                            | #    			jge loopX
+                            | #			loopend:
+                            | #		当len < n时，A需要 5 cycles，而 B 只需要 2 cycles,而len>n时，相差的3cycle又能被更大的n稀释
+                            | #		3.3.2 树的继续优化
+                            | #			3.3.2.1 优先jl以利用分支预测减小n较小时 CPE
+                            | #			3.3.2.1 合理排布以节省空间
+                            | #
+                            | ###########################################################################################
+                            | #       Average CPE: 7.49
+                            | #       Size: 999 bytes
+0x000: 6300                 |     xorq %rax,%rax
+0x002: c0f2f8ffffffffffffff |     iaddq -8, %rdx
+0x00c: 728401000000000000   |     jl loopend
+                            | 
+                            | 
+0x015:                      | loopX:
+0x015: 50170000000000000000 |     mrmovq (%rdi), %rcx # val
+0x01f: 50970800000000000000 |     mrmovq 0x8(%rdi), %r9
+0x029: 40160000000000000000 |     rmmovq %rcx, (%rsi)
+0x033: 40960800000000000000 |     rmmovq %r9, 0x8(%rsi)
+0x03d: 6211                 |     andq %rcx, %rcx
+0x03f: 715200000000000000   |     jle nopsX1
+0x048: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x052:                      | nopsX1:
+0x052: 6299                 |     andq %r9, %r9
+0x054: 716700000000000000   |     jle nopsX2
+0x05d: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x067:                      | nopsX2:
+                            | 
+                            | 
+0x067: 50171000000000000000 |     mrmovq 0x10(%rdi), %rcx # val
+0x071: 50971800000000000000 |     mrmovq 0x18(%rdi), %r9 # val
+0x07b: 40161000000000000000 |     rmmovq %rcx, 0x10(%rsi)
+0x085: 40961800000000000000 |     rmmovq %r9, 0x18(%rsi)
+0x08f: 6211                 |     andq %rcx, %rcx
+0x091: 71a400000000000000   |     jle nopsX3
+0x09a: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x0a4:                      | nopsX3:
+0x0a4: 6299                 |     andq %r9, %r9
+0x0a6: 71b900000000000000   |     jle nopsX4
+0x0af: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x0b9:                      | nopsX4:
+                            | 
+0x0b9: 50172000000000000000 |     mrmovq 0x20(%rdi), %rcx # val
+0x0c3: 50972800000000000000 |     mrmovq 0x28(%rdi), %r9 # val
+0x0cd: 40162000000000000000 |     rmmovq %rcx, 0x20(%rsi)
+0x0d7: 40962800000000000000 |     rmmovq %r9, 0x28(%rsi)
+0x0e1: 6211                 |     andq %rcx, %rcx
+0x0e3: 71f600000000000000   |     jle nopsX5
+0x0ec: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x0f6:                      | nopsX5:
+0x0f6: 6299                 |     andq %r9, %r9
+0x0f8: 710b01000000000000   |     jle nopsX6
+0x101: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x10b:                      | nopsX6:
+                            | 
+0x10b: 50173000000000000000 |     mrmovq 0x30(%rdi), %rcx # val
+0x115: 50973800000000000000 |     mrmovq 0x38(%rdi), %r9 # val
+0x11f: 40163000000000000000 |     rmmovq %rcx, 0x30(%rsi)
+0x129: 40963800000000000000 |     rmmovq %r9, 0x38(%rsi)
+0x133: 6211                 |     andq %rcx, %rcx
+0x135: 714801000000000000   |     jle nopsX7
+0x13e: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x148:                      | nopsX7:
+0x148: 6299                 |     andq %r9, %r9
+0x14a: 715d01000000000000   |     jle nopsX8
+0x153: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x15d:                      | nopsX8:
+0x15d: c0f74000000000000000 |     iaddq 0x40, %rdi
+0x167: c0f64000000000000000 |     iaddq 0x40, %rsi
+                            | 
+0x171:                      | compare:
+0x171: c0f2f8ffffffffffffff |     iaddq -8, %rdx
+0x17b: 751500000000000000   |     jge loopX
+                            | 
+0x184:                      | loopend:
+0x184: c0f20500000000000000 |     iaddq 5, %rdx
+0x18e: 72ce01000000000000   |     jl N3L
+0x197: 76a901000000000000   |     jg N3R
+0x1a0: 73ab02000000000000   |     je L3B
+0x1a9:                      | N3R:
+0x1a9: c0f2fdffffffffffffff |     iaddq -3, %rdx
+0x1b3: 72eb01000000000000   |     jl N6L
+0x1bc: 733002000000000000   |     je L6B
+0x1c5: 760702000000000000   |     jg L7B
+0x1ce:                      | N3L:
+0x1ce: c0f20200000000000000 |     iaddq 2, %rdx
+0x1d8: 73fd02000000000000   |     je L1B
+0x1e1: 76d402000000000000   |     jg L2B
+0x1ea: 90                   |     ret
+0x1eb:                      | N6L:
+0x1eb: c0f20100000000000000 |     iaddq 1,%rdx
+0x1f5: 728202000000000000   |     jl L4B
+0x1fe: 735902000000000000   |     je L5B
+0x207:                      | L7B:
+0x207: 50973000000000000000 |     mrmovq 0x30(%rdi), %r9
+0x211: 40963000000000000000 |     rmmovq %r9, 0x30(%rsi)
+0x21b: 6299                 |     andq %r9, %r9
+0x21d: 713002000000000000   |     jle nops7
+0x226: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x230:                      | nops7:
+0x230:                      | L6B:
+0x230: 50172800000000000000 |     mrmovq 0x28(%rdi), %rcx
+0x23a: 40162800000000000000 |     rmmovq %rcx, 0x28(%rsi)
+0x244: 6211                 |     andq %rcx, %rcx
+0x246: 715902000000000000   |     jle nops6
+0x24f: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x259:                      | nops6:
+0x259:                      | L5B:
+0x259: 50972000000000000000 |     mrmovq 0x20(%rdi), %r9
+0x263: 40962000000000000000 |     rmmovq %r9, 0x20(%rsi)
+0x26d: 6299                 |     andq %r9, %r9
+0x26f: 718202000000000000   |     jle nops5
+0x278: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x282:                      | nops5:
+0x282:                      | L4B:
+0x282: 50171800000000000000 |     mrmovq 0x18(%rdi), %rcx
+0x28c: 40161800000000000000 |     rmmovq %rcx, 0x18(%rsi)
+0x296: 6211                 |     andq %rcx, %rcx
+0x298: 71ab02000000000000   |     jle nops4
+0x2a1: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x2ab:                      | nops4:
+0x2ab:                      | L3B:
+0x2ab: 50971000000000000000 |     mrmovq 0x10(%rdi), %r9
+0x2b5: 40961000000000000000 |     rmmovq %r9, 0x10(%rsi)
+0x2bf: 6299                 |     andq %r9, %r9
+0x2c1: 71d402000000000000   |     jle nops3
+0x2ca: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x2d4:                      | nops3:
+0x2d4:                      | L2B:
+0x2d4: 50170800000000000000 |     mrmovq 0x8(%rdi), %rcx
+0x2de: 40160800000000000000 |     rmmovq %rcx, 0x8(%rsi)
+0x2e8: 6211                 |     andq %rcx, %rcx
+0x2ea: 71fd02000000000000   |     jle nops2
+0x2f3: c0f00100000000000000 |     iaddq 0x1, %rax # cnt + 1
+0x2fd:                      | nops2:
+0x2fd:                      | L1B:
+0x2fd: 50970000000000000000 |     mrmovq (%rdi), %r9
+0x307: 40960000000000000000 |     rmmovq %r9, (%rsi)
+0x311: 6299                 |     andq %r9, %r9
+0x313: 712603000000000000   |     jle nops1
+0x31c: c0f00100000000000000 |     iaddq 0x1, %rax
+0x326:                      | nops1:
+                            | ##################################################################
+                            | # Do not modify the following section of code
+                            | # Function epilogue.
+0x326:                      | Done:
+0x326: 90                   | 	ret
+                            | ##################################################################
+                            | # Keep the following label at the end of your function
+0x327:                      | End:
+                            | #/* end ncopy-ys */

@@ -1,0 +1,394 @@
+#######################################################################
+# Test for copying block of size 4;
+#######################################################################
+	.pos 0
+main:	irmovq Stack, %rsp  	# Set up stack pointer
+
+	# Set up arguments for copy function and then invoke it
+	irmovq $4, %rdx		# src and dst have 4 elements
+	irmovq dest, %rsi	# dst array
+	irmovq src, %rdi	# src array
+	call ncopy		 
+	halt			# should halt with num nonzeros in %rax
+StartFun:
+#/* begin ncopy-ys */
+##################################################################
+# ncopy.ys - Copy a src block of len words to dst.
+# Return the number of positive words (>0) contained in src.
+#
+# Include your name and ID here.
+#
+# Describe how and why you modified the baseline code.
+#
+##################################################################
+# Do not modify this portion
+# Function prologue.
+# %rdi = src, %rsi = dst, %rdx = len
+ncopy:
+
+##################################################################
+# 0. 优化原则
+#	0.1 性能计分按照数组大小从1～64平均计算CPE，因而有两个优化方向：
+#		0.1.1 降低每次拷贝数据的操作[L]
+#		0.1.2 降低循环以外的常数次操作[C](经过测试，最少的常数次操作是[C0]10次,即直接ret的操作数)
+
+#	0.2 Average CPE=\Sigma( L + C / n)= L + 0.075 * C = L + 0.075 * Cf + 0.75, 因而 L 必须降低到 6.75 以下，考虑到函数中的常数操作[Cf]的影响以及[L]的计算公式，因而
+#		0.2.1 L应当控制在5 ～ 6
+#		0.2.2 Cf不应当超过30
+#
+# 1. 循环展开 [-L, +Cf, +size]
+#	循环展开能有效降低无用的addq，理论上展开的越多性能越好，然而循环展开会增加边界判断的开销，并且增加文件大小
+#	考虑展开 n 层循环, L = 6 + 3/n，由 0.2.1, n>=3, 以下是相对性能
+#	n	CPE
+#	4	9.55
+#	8	8.75
+#	16	9.23
+#	n = 16 时 文件大小已经几乎超过 1000b 没有进一步的优化空间,而Cf带来的损耗已经超过了循环展开的收益
+#	因而考虑n = 8 ～ 13的循环展开
+# 2. 消除 nop [-L]
+# 	2.1 加载使用，交叉相邻 2 ～  3条 load-use 以消除
+#		mrmovq (%rdi), %rcx # val
+#    		mrmovq 0x8(%rdi), %r9
+#    		rmmovq %rcx, (%rsi)
+#    		rmmovq %r9, 0x8(%rsi)
+#    		andq %rcx, %rcx
+#    		jle nopsX1
+#    		iaddq 0x1, %rax # cnt + 1
+#		nopsX1:
+#    		andq %r9, %r9
+#    		jle nopsX2
+#    		iaddq 0x1, %rax # cnt + 1
+#		nopsX2:
+#	然而实际上在ncopy中所有的load-use中use都是只读不写，在 pipe-full中加入 mValM-eValA 的转发，彻底消除 mrmove - rmmovq 中的气泡
+#	L = 5 + 3 / n
+#
+#	2.2 分支预测，使用cmove消除，然而cmove并没有提高性能也没有减小文件大小
+# 3. Cf 优化
+#	3.1 使用 iaddq
+#	3.2 使用 树状结构处理边界条件, 考虑一次op可以同时使jl,je,jg工作，充分利用每次op的信息，因而有以下两种优化（未修改forward）
+#		3.2.1
+#    			iaddq 0xfffffffffffffff6, %rdx
+#    			jge loopX
+#    			irmovq 0x1, %r10
+#    			andq %rdx, %r10
+#    			jne LO
+#	    		iaddq 0x8, %rdx
+#    			jl Done
+#    			je L2
+#    			iaddq 0xfffffffffffffffc, %rdx
+#    			jl L4
+#    			je L6
+#    			jg L8
+#			LO:
+#    			mrmovq (%rdi), %r9 # val
+#    			iaddq 0x8, %rdi
+#			rmmovq %r9, (%rsi)
+#			iaddq 0x8, %rsi
+#			andq %r9, %r9
+#			jle nopsO
+#			iaddq 0x1, %rax # cnt + 1
+#			nopsO:
+#			iaddq 0x7, %rdx
+#			jl Done
+#			je L2
+#
+#			iaddq 0xfffffffffffffffc, %rdx
+#			jl L4
+#			je L6
+#			L8:
+#			mrmovq 0x38(%rdi), %rcx
+#			mrmovq 0x30(%rdi), %r9
+#			rmmovq %rcx, 0x38(%rsi)
+#			rmmovq %r9, 0x30(%rsi)
+#			andq %rcx, %rcx
+#			jle nops8
+#			iaddq 0x1, %rax # cnt + 1
+#			nops8:
+#			andq %r9, %r9
+#			jle nops7
+#			iaddq 0x1, %rax # cnt + 1
+#			nops7:
+#			L6:
+#			mrmovq 0x28(%rdi), %rcx # val
+#			mrmovq 0x20(%rdi), %r9 # val
+#			rmmovq %rcx, 0x28(%rsi)
+#			rmmovq %r9, 0x20(%rsi)
+#			andq %rcx, %rcx
+#			jle nops6
+#			iaddq 0x1, %rax # cnt + 1
+#			nops6:
+#			andq %r9, %r9
+#			jle nops5
+#			iaddq 0x1, %rax # cnt + 1
+#			nops5:
+#			L4:
+#			mrmovq 0x18(%rdi), %rcx # val
+#			mrmovq 0x10(%rdi), %r9 # val
+#			rmmovq %rcx, 0x18(%rsi)
+#			rmmovq %r9, 0x10(%rsi)
+#			andq %rcx, %rcx
+#			jle nops4
+#			iaddq 0x1, %rax # cnt + 1
+#			nops4:
+#			andq %r9, %r9
+#			jle nops3
+#			iaddq 0x1, %rax # cnt + 1
+#			nops3:
+#			L2:
+#			mrmovq 0x8(%rdi), %rcx # val
+#			mrmovq (%rdi), %r9 # val
+#			rmmovq %rcx, 0x8(%rsi)
+#			rmmovq %r9, (%rsi)
+#			andq %rcx, %rcx
+#			jle nops2
+#			iaddq 0x1, %rax # cnt + 1
+#			nops2:
+#			andq %r9, %r9
+#			jle nops1
+#			iaddq 0x1, %rax # cnt + 1
+#			nops1:
+#		3.2.2 即目前使用的结构
+#	3.2.1分奇数偶数处理，受限于文件大小，效果不佳，3.2.2使用优先 n=1, n=2, n=3的树状结构，在不使用forward的情况下能达到 7.73
+#	3.3 优化n较小时的情况
+#		观察 CPE发现，当n较大时往往CPE能小于7.5甚至7，而n<8时CPE往往非常高，因而需要在不影响 L的情况下继续优化 Cf
+#		3.3.1 循环旁路
+#		A:
+#			jmp compare
+#				Loop
+#			compare:
+#    			iaddq 0xfffffffffffffff6, %rdx
+#    			jge loopX
+#		B:
+#			iaddq 0xfffffffffffffff6, %rdx
+#			jl loopend
+#				Loop
+#			compare:
+#    			iaddq 0xfffffffffffffff6, %rdx
+#    			jge loopX
+#			loopend:
+#		当len < n时，A需要 5 cycles，而 B 只需要 2 cycles,而len>n时，相差的3cycle又能被更大的n稀释
+#		3.3.2 树的继续优化
+#			3.3.2.1 优先jl以利用分支预测减小n较小时 CPE
+#			3.3.2.1 合理排布以节省空间
+###########################################################################################
+#       Average CPE: 7.48
+#       Size: 999 bytes
+
+    iaddq 0xfffffffffffffff6, %rdx
+    jl loopend
+
+
+loopX:
+    mrmovq (%rdi), %rcx # val
+    mrmovq 0x8(%rdi), %r9
+    rmmovq %rcx, (%rsi)
+    rmmovq %r9, 0x8(%rsi)
+    andq %rcx, %rcx
+    jle nopsX1
+    iaddq 0x1, %rax # cnt + 1
+nopsX1:
+    andq %r9, %r9
+    jle nopsX2
+    iaddq 0x1, %rax # cnt + 1
+nopsX2:
+
+
+    mrmovq 0x10(%rdi), %rcx # val
+    mrmovq 0x18(%rdi), %r9 # val
+    rmmovq %rcx, 0x10(%rsi)
+    rmmovq %r9, 0x18(%rsi)
+    andq %rcx, %rcx
+    jle nopsX3
+    iaddq 0x1, %rax # cnt + 1
+nopsX3:
+    andq %r9, %r9
+    jle nopsX4
+    iaddq 0x1, %rax # cnt + 1
+nopsX4:
+
+    mrmovq 0x20(%rdi), %rcx # val
+    mrmovq 0x28(%rdi), %r9 # val
+    rmmovq %rcx, 0x20(%rsi)
+    rmmovq %r9, 0x28(%rsi)
+    andq %rcx, %rcx
+    jle nopsX5
+    iaddq 0x1, %rax # cnt + 1
+nopsX5:
+    andq %r9, %r9
+    jle nopsX6
+    iaddq 0x1, %rax # cnt + 1
+nopsX6:
+
+    mrmovq 0x30(%rdi), %rcx # val
+    mrmovq 0x38(%rdi), %r9 # val
+    rmmovq %rcx, 0x30(%rsi)
+    rmmovq %r9, 0x38(%rsi)
+    andq %rcx, %rcx
+    jle nopsX7
+    iaddq 0x1, %rax # cnt + 1
+nopsX7:
+    andq %r9, %r9
+    jle nopsX8
+    iaddq 0x1, %rax # cnt + 1
+nopsX8:
+    mrmovq 0x40(%rdi), %rcx # val
+    mrmovq 0x48(%rdi), %r9 # val
+    rmmovq %rcx, 0x40(%rsi)
+    rmmovq %r9, 0x48(%rsi)
+    andq %rcx, %rcx
+    jle nopsX9
+    iaddq 0x1, %rax # cnt + 1
+nopsX9:
+    andq %r9, %r9
+    jle nopsXA
+    iaddq 0x1, %rax # cnt + 1
+nopsXA:
+    iaddq 0x50, %rdi
+    iaddq 0x50, %rsi
+
+compare:
+    iaddq 0xfffffffffffffff6, %rdx
+    jge loopX
+
+loopend:
+    iaddq 0x7, %rdx
+    jl N3L
+    jg N3R
+    je L3B
+N3R:
+    iaddq -3, %rdx
+    jl N6L
+    je L6B
+N6R:
+    iaddq -2, %rdx
+    jl L7B
+    je L8B
+    jmp L9B
+
+N3L:
+    iaddq 2, %rdx
+    je L1B
+    jg L2B
+    ret
+N6L:
+    iaddq 1,%rdx
+    jl L4B
+    je L5B
+
+L9B:
+    mrmovq 0x40(%rdi), %r9
+    rmmovq %r9, 0x40(%rsi)
+    andq %r9, %r9
+    jle nops9
+    iaddq 0x1, %rax # cnt + 1
+nops9:
+L8B:
+    mrmovq 0x38(%rdi), %rcx
+    rmmovq %rcx, 0x38(%rsi)
+    andq %rcx, %rcx
+    jle nops8
+    iaddq 0x1, %rax # cnt + 1
+nops8:
+
+L7B:
+    mrmovq 0x30(%rdi), %r9
+    rmmovq %r9, 0x30(%rsi)
+    andq %r9, %r9
+    jle nops7
+    iaddq 0x1, %rax # cnt + 1
+nops7:
+L6B:
+    mrmovq 0x28(%rdi), %rcx
+    rmmovq %rcx, 0x28(%rsi)
+    andq %rcx, %rcx
+    jle nops6
+    iaddq 0x1, %rax # cnt + 1
+nops6:
+L5B:
+    mrmovq 0x20(%rdi), %r9
+    rmmovq %r9, 0x20(%rsi)
+    andq %r9, %r9
+    jle nops5
+    iaddq 0x1, %rax # cnt + 1
+nops5:
+L4B:
+    mrmovq 0x18(%rdi), %rcx
+    rmmovq %rcx, 0x18(%rsi)
+    andq %rcx, %rcx
+    jle nops4
+    iaddq 0x1, %rax # cnt + 1
+nops4:
+L3B:
+    mrmovq 0x10(%rdi), %r9
+    rmmovq %r9, 0x10(%rsi)
+    andq %r9, %r9
+    jle nops3
+    iaddq 0x1, %rax # cnt + 1
+nops3:
+L2B:
+    mrmovq 0x8(%rdi), %rcx
+    rmmovq %rcx, 0x8(%rsi)
+    andq %rcx, %rcx
+    jle nops2
+    iaddq 0x1, %rax # cnt + 1
+nops2:
+L1B:
+    mrmovq (%rdi), %r9
+    rmmovq %r9, (%rsi)
+    andq %r9, %r9
+    jle nops1
+    iaddq 0x1, %rax
+nops1:
+##################################################################
+# Do not modify the following section of code
+# Function epilogue.
+Done:
+	ret
+##################################################################
+# Keep the following label at the end of your function
+End:
+#/* end ncopy-ys */
+EndFun:
+
+###############################
+# Source and destination blocks 
+###############################
+	.align 8
+src:
+	.quad 1
+	.quad -2
+	.quad 3
+	.quad -4
+	.quad 0xbcdefa # This shouldn't get moved
+
+	.align 16
+Predest:
+	.quad 0xbcdefa
+dest:
+	.quad 0xcdefab
+	.quad 0xcdefab
+	.quad 0xcdefab
+	.quad 0xcdefab
+Postdest:
+	.quad 0xdefabc
+
+.align 8
+# Run time stack
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+	.quad 0
+
+Stack:

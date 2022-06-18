@@ -1,0 +1,33 @@
+.pos 0
+init:
+    irmovq stack, %rsp
+    irmovq ele1, %rdi
+    call rsum_list
+    halt
+.align 8
+ele1:
+    .quad 0x00a
+    .quad ele2
+ele2:
+    .quad 0x0b0
+    .quad ele3
+ele3:
+    .quad 0xc00
+    .quad 0
+
+rsum_list:
+    andq %rdi, %rdi
+    je quit
+
+    mrmovq (%rdi), %rbx
+    pushq %rbx
+    mrmovq $0x8(%rdi), %rdi
+    call rsum_list
+    popq %rbx
+    addq  %rbx, %rax
+quit:
+    ret
+
+
+.pos 300
+stack:
